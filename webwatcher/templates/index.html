@@ -1,0 +1,91 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Web Watcher</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans"; margin: 24px; }
+    h1 { font-size: 22px; }
+    form { display: grid; gap: 12px; max-width: 720px; }
+    label { font-weight: 600; }
+    input, textarea { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 10px; }
+    button { padding: 10px 14px; border-radius: 10px; border: 0; cursor: pointer; }
+    .primary { background: black; color: white; }
+    .card { border: 1px solid #eee; padding: 16px; border-radius: 14px; margin-top: 20px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 8px; border-bottom: 1px solid #f0f0f0; text-align: left; }
+    .row-actions { display: flex; gap: 8px; }
+    .muted { color: #666; font-size: 13px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  </style>
+</head>
+<body>
+  <h1>Web Watcher</h1>
+  <p class="muted">Poll a webpage on an interval, take a screenshot, OCR the contents, and (optionally) ping a Discord webhook if text is found.</p>
+
+  <form method="post" action="/jobs">
+    <div>
+      <label>Website URL</label>
+      <input type="url" name="url" placeholder="https://example.com" required>
+    </div>
+    <div>
+      <label>Text to watch for</label>
+      <input name="search_text" placeholder="e.g., 'Registration open' or 'Sold out'" required>
+    </div>
+    <div>
+      <label>Frequency (minutes)</label>
+      <input type="number" name="minutes" min="1" value="10" required>
+    </div>
+    <div>
+      <label>Discord Webhook URL (optional)</label>
+      <input type="url" name="webhook_url" placeholder="https://discord.com/api/webhooks/...">
+      <div class="muted">Create one in Discord: Server Settings → Integrations → Webhooks.</div>
+    </div>
+    <div>
+      <button class="primary" type="submit">Create job</button>
+    </div>
+  </form>
+
+  <div class="card">
+    <h2>Jobs</h2>
+    {% if jobs|length == 0 %}
+      <p class="muted">No jobs yet — add one above.</p>
+    {% else %}
+      <table>
+        <thead><tr><th>URL</th><th>Search text</th><th>Every</th><th>Created</th><th>Artifacts</th><th>Actions</th></tr></thead>
+        <tbody>
+          {% for j in jobs %}
+          <tr>
+            <td class="mono">{{ j.url }}</td>
+            <td class="mono">{{ j.search_text }}</td>
+            <td>{{ j.minutes }} min</td>
+            <td class="muted">{{ j.created_at }}</td>
+            <td>
+              <a href="/data/{{ j.id }}/" target="_blank">/data/{{ j.id }}/</a><br>
+              <a href="/jobs/{{ j.id }}/latest" target="_blank">latest.txt</a>
+            </td>
+            <td class="row-actions">
+              <form method="post" action="/jobs/{{ j.id }}/run-now"><button type="submit">Run now</button></form>
+              <form method="post" action="/jobs/{{ j.id }}/delete" onsubmit="return confirm('Delete this job?');"><button type="submit">Delete</button></form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3>Notes</h3>
+    <ul>
+      <li>Artifacts (screenshots & OCR text) are saved under <span class="mono">/data/&lt;job_id&gt;/</span> and served at <span class="mono">/data</span>.</li>
+      <li>Discord notifications include a link to the latest screenshot when a match is found.</li>
+      <li>Sites behind logins, heavy bot detection, or requiring interaction may need custom steps. This starter polls a public URL.</li>
+    </ul>
+  </div>
+</body>
+</html>

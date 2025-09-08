@@ -1,0 +1,10 @@
+services:
+  webwatcher:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_PATH=/app/jobs.db
+      - DATA_DIR=/app/data
+    volumes:
+      - ./data:/app/data
