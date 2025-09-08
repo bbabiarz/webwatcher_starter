@@ -132,6 +132,29 @@ async def screenshot_and_ocr(url: str, save_dir: Path) -> tuple[Path, str]:
             # Load page; be tolerant to failures but still take a screenshot
             try:
                 await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+                
+                # Wait for page to really settle, then optional extra delay / selector
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    # keep going even if network never goes fully idle
+                    await page.wait_for_timeout(2000)
+
+                # Optional: wait for a specific element to appear (from env WAIT_SELECTOR)
+                wait_selector = os.getenv("WAIT_SELECTOR", "").strip()
+                if wait_selector:
+                    try:
+                        await page.wait_for_selector(wait_selector, timeout=15000)
+                    except Exception:
+                        # don't fail the run just because the selector wasn't found in time
+                        await page.wait_for_timeout(1000)
+
+                # Optional: fixed extra delay in ms (from env WAIT_AFTER_LOAD_MS)
+                extra_ms = int(os.getenv("WAIT_AFTER_LOAD_MS", "0"))
+                if extra_ms > 0:
+                    await page.wait_for_timeout(extra_ms)
+
+                
             except Exception:
                 # fall back: give the page a moment even if goto errored
                 await page.wait_for_timeout(3000)
