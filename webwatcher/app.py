@@ -25,6 +25,9 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # ---------- App & templating ----------
 app = FastAPI(title="Web Watcher")
 templates = Jinja2Templates(directory="templates")
+STATIC_DIR = Path("static")
+STATIC_DIR.mkdir(parents=True, exist_ok=True)  # ensure it exists
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 app.mount("/data", StaticFiles(directory=str(DATA_DIR)), name="data")
 
