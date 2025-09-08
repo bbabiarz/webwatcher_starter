@@ -77,7 +77,9 @@ def list_jobs():
         return [dict(r) for r in rows]
 
 # ---------- Scheduler ----------
-scheduler = BackgroundScheduler()
+from apscheduler.schedulers.background import BackgroundScheduler
+
+scheduler = BackgroundScheduler(timezone=os.getenv("TZ", "UTC"))
 
 def schedule_job(job):
     trigger = IntervalTrigger(minutes=job["minutes"])

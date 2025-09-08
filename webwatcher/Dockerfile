@@ -1,8 +1,12 @@
-# Uses official Playwright image with Chromium already installed
+# Dockerfile
 FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
-# Add Tesseract for OCR
+# Avoid tzdata interactive prompt, set a default TZ
+ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
+
+# Add tzdata (for zoneinfo) + tesseract
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    tzdata \
     tesseract-ocr \
  && rm -rf /var/lib/apt/lists/*
 
@@ -12,8 +16,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Persist artifacts
 VOLUME ["/app/data"]
-
 EXPOSE 8000
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
