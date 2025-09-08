@@ -19,6 +19,8 @@ import httpx
 from fastapi.responses import HTMLResponse
 import shutil
 import json
+import re, shutil, json
+
 
 
 
@@ -41,6 +43,7 @@ app.mount("/data", StaticFiles(directory=str(DATA_DIR)), name="data")
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
+        # create (new installs)
         c.execute("""
             CREATE TABLE IF NOT EXISTS jobs(
                 id TEXT PRIMARY KEY,
@@ -48,17 +51,25 @@ def init_db():
                 search_text TEXT NOT NULL,
                 minutes INTEGER NOT NULL,
                 webhook_url TEXT,
+                price_threshold REAL,
                 created_at TEXT NOT NULL
             )
         """)
+        # migrate (existing DBs that lack price_threshold)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "price_threshold" not in cols:
+            c.execute("ALTER TABLE jobs ADD COLUMN price_threshold REAL")
         conn.commit()
+
 
 def insert_job(job):
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?)",
-                  (job["id"], job["url"], job["search_text"], job["minutes"], job.get("webhook_url"), job["created_at"]))
+        c.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?)",
+                  (job["id"], job["url"], job["search_text"], job["minutes"],
+                   job.get("webhook_url"), job.get("price_threshold"), job["created_at"]))
         conn.commit()
+
 
 def delete_job(job_id):
     with sqlite3.connect(DB_PATH) as conn:
@@ -98,6 +109,44 @@ def list_files(job_id: str):
     items = sorted(job_dir.iterdir(), reverse=True)
     lis = "".join(f'<li><a href="/data/{job_id}/{p.name}">{p.name}</a></li>' for p in items)
     return HTMLResponse(f"<h3>Artifacts for {job_id}</h3><ul>{lis}</ul>")
+
+from typing import Optional
+from fastapi import Form
+
+@app.post("/jobs", response_class=RedirectResponse)
+def create_job(url: str = Form(...),
+               search_text: str = Form(...),
+               minutes: int = Form(...),
+               webhook_url: Optional[str] = Form(None),
+               price_threshold: Optional[float] = Form(None)):
+    if minutes < 1:
+        raise HTTPException(400, "Minutes must be >= 1")
+    job = {
+        "id": str(uuid.uuid4()),
+        "url": url.strip(),
+        "search_text": search_text.strip(),
+        "minutes": minutes,
+        "webhook_url": webhook_url.strip() if webhook_url else None,
+        "price_threshold": float(price_threshold) if price_threshold not in (None, "") else None,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    insert_job(job)
+    schedule_job(job)
+    return RedirectResponse(url="/", status_code=303)
+
+_PRICE_RE = re.compile(
+    r'(?i)(?:C\$|CA\$|\$|USD|CAD)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)'
+)
+
+def extract_prices(text: str) -> list[float]:
+    vals = []
+    for m in _PRICE_RE.finditer(text):
+        num = m.group(1).replace(",", "")
+        try:
+            vals.append(float(num))
+        except ValueError:
+            pass
+    return vals
 
 
 
@@ -187,35 +236,62 @@ async def run_job(job_id: str):
     job = get_job(job_id)
     if not job:
         return
+
     url = job["url"]
     search_text = job["search_text"]
     webhook_url = job.get("webhook_url") or None
+    price_threshold = job.get("price_threshold")
     job_dir = DATA_DIR / job_id
 
     img_path, text = await screenshot_and_ocr(url, job_dir)
 
+    # Maintain a stable pointer
     latest_img = job_dir / "latest.png"
     try:
-        latest_img.unlink(missing_ok=True)
-    except Exception:
-        pass
-    shutil.copy(img_path, latest_img)
+        if latest_img.exists():
+            latest_img.unlink()
+        shutil.copy(img_path, latest_img)
+    except Exception as e:
+        (job_dir / "latest_copy_error.log").write_text(str(e), encoding="utf-8")
 
-    matched = search_text.lower() in text.lower()
-    summary = (
-        f"Checked: {url}\n"
-        f"At (UTC): {datetime.utcnow().isoformat()}\n"
-        f"Matched: {matched}\n"
-        f"Search text: {search_text}\n"
-    )
-    (job_dir / "latest.txt").write_text(summary, encoding="utf-8")
+    # Text match (old behavior)
+    text_match = search_text.lower() in text.lower() if search_text else False
 
+    # Price match (new behavior)
+    found_prices = extract_prices(text)
+    min_price = min(found_prices) if found_prices else None
+    price_ok = (min_price is not None and price_threshold is not None and min_price <= float(price_threshold))
+
+    matched = bool(text_match or price_ok)
+
+    # Update latest.txt
+    summary_lines = [
+        f"Checked: {url}",
+        f"At (UTC): {datetime.utcnow().isoformat()}",
+        f"Matched: {matched}",
+        f"Search text: {search_text}",
+        f"Threshold: {price_threshold if price_threshold is not None else '—'}",
+        f"Found prices: {', '.join(map(lambda p: f'{p:.2f}', found_prices)) if found_prices else 'none'}",
+        f"Min price: {min_price:.2f}" if min_price is not None else "Min price: —",
+        f"Trigger reason: {'price≤threshold' if price_ok else ('text' if text_match else 'none')}",
+    ]
+    (job_dir / "latest.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+    # Notify Discord with file upload (works without public URL)
     if matched and webhook_url:
-        image_rel = f"/data/{job_id}/{img_path.name}"
+        base = os.getenv("PUBLIC_BASE_URL")
+        external_url = f"{base}/data/{job_id}/{img_path.name}" if base else None
+        reason = "price ≤ threshold" if price_ok else "text match"
+        msg = f"✅ Match ({reason}) for '{search_text}' on {url}"
+        if min_price is not None:
+            msg += f"\nLowest detected price: {min_price:.2f}"
+            if price_threshold is not None:
+                msg += f" (threshold: {float(price_threshold):.2f})"
         try:
-            await notify_discord(webhook_url, f"✅ Match found for '{search_text}' on {url}", image_rel)
+            await notify_discord(webhook_url, msg, image_path=img_path, external_url=external_url)
         except Exception as e:
             (job_dir / "discord_error.log").write_text(str(e), encoding="utf-8")
+
 
 async def notify_discord(webhook_url: str, content: str, image_path: Optional[Path] = None, external_url: Optional[str] = None):
     async with httpx.AsyncClient(timeout=30) as client:

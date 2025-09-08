@@ -46,6 +46,12 @@
       <div class="muted">Create one in Discord: Server Settings → Integrations → Webhooks.</div>
     </div>
     <div>
+      <label>Notify at or below price (optional)</label>
+      <input type="number" name="price_threshold" min="0" step="0.01" placeholder="e.g., 450">
+      <div class="muted">Alert if any detected price (e.g., C$406) ≤ this value.</div>
+    </div>
+
+    <div>
       <button class="primary" type="submit">Create job</button>
     </div>
   </form>
