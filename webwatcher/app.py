@@ -75,15 +75,26 @@ def list_jobs():
         c.execute("SELECT * FROM jobs ORDER BY created_at DESC")
         rows = c.fetchall()
         return [dict(r) for r in rows]
+    
+from fastapi.responses import JSONResponse
+import asyncio
+
+@app.post("/jobs/{job_id}/run-now")
+async def run_now(job_id: str):
+    asyncio.create_task(run_job(job_id))  # fire-and-forget
+    return JSONResponse({"ok": True})
+
 
 # ---------- Scheduler ----------
-from apscheduler.schedulers.background import BackgroundScheduler
-
-scheduler = BackgroundScheduler(timezone=os.getenv("TZ", "UTC"))
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+scheduler = AsyncIOScheduler(timezone=os.getenv("TZ", "UTC"))
 
 def schedule_job(job):
     trigger = IntervalTrigger(minutes=job["minutes"])
-    scheduler.add_job(run_job, trigger=trigger, args=[job["id"]], id=job["id"], replace_existing=True)
+    # target the coroutine directly (AsyncIOScheduler will await it)
+    scheduler.add_job(run_job, trigger=trigger, args=[job["id"]],
+                      id=job["id"], replace_existing=True)
+
 
 async def screenshot_and_ocr(url: str, save_dir: Path) -> tuple[Path, str]:
     save_dir.mkdir(parents=True, exist_ok=True)
