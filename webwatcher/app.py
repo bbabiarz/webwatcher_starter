@@ -95,6 +95,8 @@ def schedule_job(job):
     scheduler.add_job(run_job, trigger=trigger, args=[job["id"]],
                       id=job["id"], replace_existing=True)
 
+import logging, traceback
+logging.basicConfig(level=logging.INFO)
 
 async def screenshot_and_ocr(url: str, save_dir: Path) -> tuple[Path, str]:
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -104,18 +106,70 @@ async def screenshot_and_ocr(url: str, save_dir: Path) -> tuple[Path, str]:
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        page = await browser.new_page(viewport={"width": 1366, "height": 768})
+        context = await browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            device_scale_factor=2,
+            timezone_id=os.getenv("TZ", "UTC"),
+        )
+        page = await context.new_page()
         try:
-            await page.goto(url, timeout=60000, wait_until="networkidle")
-        except Exception:
-            # Try a slower wait
-            await page.wait_for_timeout(5000)
-        await page.screenshot(path=str(img_path), full_page=True)
-        await browser.close()
+            # Load page; be tolerant to failures but still take a screenshot
+            try:
+                await page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            except Exception:
+                # fall back: give the page a moment even if goto errored
+                await page.wait_for_timeout(3000)
 
-    text = pytesseract.image_to_string(Image.open(img_path))
+            # Always capture a full-page PNG for debugging/notifications
+            await page.screenshot(path=str(img_path), full_page=True)
+
+            # Try DOM text first (faster & cleaner than OCR)
+            dom_text = await page.evaluate("() => document.body.innerText || ''")
+            text = dom_text.strip()
+            if not text:
+                from PIL import Image
+                import pytesseract
+                text = pytesseract.image_to_string(Image.open(img_path))
+
+        except Exception:
+            (save_dir / f"{ts}.error.log").write_text(
+                f"URL: {url}\n{traceback.format_exc()}",
+                encoding="utf-8",
+            )
+            raise
+        finally:
+            await context.close()
+            await browser.close()
+
     text_path.write_text(text, encoding="utf-8")
     return img_path, text
+
+async def run_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return
+    url = job["url"]
+    search_text = job["search_text"]
+    webhook_url = job.get("webhook_url") or None
+    job_dir = DATA_DIR / job_id
+
+    img_path, text = await screenshot_and_ocr(url, job_dir)
+
+    matched = search_text.lower() in text.lower()
+    summary = (
+        f"Checked: {url}\n"
+        f"At (UTC): {datetime.utcnow().isoformat()}\n"
+        f"Matched: {matched}\n"
+        f"Search text: {search_text}\n"
+    )
+    (job_dir / "latest.txt").write_text(summary, encoding="utf-8")
+
+    if matched and webhook_url:
+        image_rel = f"/data/{job_id}/{img_path.name}"
+        try:
+            await notify_discord(webhook_url, f"✅ Match found for '{search_text}' on {url}", image_rel)
+        except Exception as e:
+            (job_dir / "discord_error.log").write_text(str(e), encoding="utf-8")
 
 async def notify_discord(webhook_url: str, content: str, image_url: Optional[str] = None):
     payload = {"content": content}
@@ -128,30 +182,7 @@ async def notify_discord(webhook_url: str, content: str, image_url: Optional[str
 def run_job_sync(job_id: str):
     asyncio.run(run_job(job_id))
 
-async def run_job(job_id: str):
-    job = get_job(job_id)
-    if not job:
-        return
-    url = job["url"]
-    search_text = job["search_text"]
-    webhook_url = job.get("webhook_url") or None
-    job_dir = DATA_DIR / job_id
-    img_path, text = await screenshot_and_ocr(url, job_dir)
 
-    matched = search_text.lower() in text.lower()
-    # Save a latest.txt summary
-    summary = f"Checked: {url}\nAt (UTC): {datetime.utcnow().isoformat()}\nMatched: {matched}\nSearch text: {search_text}\n"
-    (job_dir / "latest.txt").write_text(summary, encoding="utf-8")
-
-    # If matched, send Discord notification (optional)
-    if matched and webhook_url:
-        # Build a public-ish URL path served by this app
-        # Example: /data/<job_id>/<filename>
-        image_rel = f"/data/{job_id}/{img_path.name}"
-        try:
-            await notify_discord(webhook_url, f"✅ Match found for '{search_text}' on {url}", image_rel)
-        except Exception as e:
-            (job_dir / "discord_error.log").write_text(str(e), encoding="utf-8")
 
 # ---------- Routes ----------
 @app.get("/", response_class=HTMLResponse)
@@ -179,9 +210,8 @@ def create_job(url: str = Form(...),
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/jobs/{job_id}/run-now")
-def run_now(job_id: str):
-    # fire-and-forget immediate run
-    scheduler.add_job(run_job_sync, args=[job_id], replace_existing=False)
+async def run_now(job_id: str):
+    await run_job(job_id)
     return JSONResponse({"ok": True})
 
 @app.post("/jobs/{job_id}/delete", response_class=RedirectResponse)
@@ -201,6 +231,18 @@ def latest_text(job_id: str):
     if f.exists():
         return FileResponse(str(f))
     raise HTTPException(404, "No latest summary yet.")
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/jobs/{job_id}/files", response_class=HTMLResponse)
+def list_files(job_id: str):
+    job_dir = DATA_DIR / job_id
+    if not job_dir.exists():
+        return HTMLResponse("<p>No files yet.</p>", status_code=404)
+    items = sorted(job_dir.iterdir(), reverse=True)
+    lis = "".join(f'<li><a href="/data/{job_id}/{p.name}">{p.name}</a></li>' for p in items)
+    return HTMLResponse(f"<h3>Artifacts for {job_id}</h3><ul>{lis}</ul>")
+
 
 # ---------- Startup ----------
 @app.on_event("startup")
