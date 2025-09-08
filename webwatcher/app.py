@@ -16,6 +16,12 @@ from apscheduler.triggers.interval import IntervalTrigger
 import asyncio
 from playwright.async_api import async_playwright
 import httpx
+from fastapi.responses import HTMLResponse
+import shutil
+import json
+
+
+
 
 # ---------- Config ----------
 DB_PATH = os.environ.get("DB_PATH", "jobs.db")
@@ -83,6 +89,16 @@ import asyncio
 async def run_now(job_id: str):
     asyncio.create_task(run_job(job_id))  # fire-and-forget
     return JSONResponse({"ok": True})
+
+@app.get("/jobs/{job_id}/files", response_class=HTMLResponse)
+def list_files(job_id: str):
+    job_dir = DATA_DIR / job_id
+    if not job_dir.exists():
+        return HTMLResponse("<p>No files yet.</p>", status_code=404)
+    items = sorted(job_dir.iterdir(), reverse=True)
+    lis = "".join(f'<li><a href="/data/{job_id}/{p.name}">{p.name}</a></li>' for p in items)
+    return HTMLResponse(f"<h3>Artifacts for {job_id}</h3><ul>{lis}</ul>")
+
 
 
 # ---------- Scheduler ----------
@@ -155,6 +171,13 @@ async def run_job(job_id: str):
 
     img_path, text = await screenshot_and_ocr(url, job_dir)
 
+    latest_img = job_dir / "latest.png"
+    try:
+        latest_img.unlink(missing_ok=True)
+    except Exception:
+        pass
+    shutil.copy(img_path, latest_img)
+
     matched = search_text.lower() in text.lower()
     summary = (
         f"Checked: {url}\n"
@@ -171,13 +194,21 @@ async def run_job(job_id: str):
         except Exception as e:
             (job_dir / "discord_error.log").write_text(str(e), encoding="utf-8")
 
-async def notify_discord(webhook_url: str, content: str, image_url: Optional[str] = None):
-    payload = {"content": content}
-    if image_url:
-        payload["embeds"] = [{"image": {"url": image_url}}]
+async def notify_discord(webhook_url: str, content: str, image_path: Optional[Path] = None, external_url: Optional[str] = None):
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(webhook_url, json=payload)
+        if image_path and image_path.exists():
+            payload = {
+                "content": content,
+                "embeds": [{"image": {"url": f"attachment://{image_path.name}"}}]
+            }
+            files = {"file": (image_path.name, image_path.read_bytes(), "image/png")}
+            r = await client.post(webhook_url, data={"payload_json": json.dumps(payload)}, files=files)
+        else:
+            # fallback: just send text (optionally include an external URL)
+            payload = {"content": f"{content}\n{external_url}" if external_url else content}
+            r = await client.post(webhook_url, json=payload)
         r.raise_for_status()
+
 
 def run_job_sync(job_id: str):
     asyncio.run(run_job(job_id))
@@ -242,6 +273,56 @@ def list_files(job_id: str):
     items = sorted(job_dir.iterdir(), reverse=True)
     lis = "".join(f'<li><a href="/data/{job_id}/{p.name}">{p.name}</a></li>' for p in items)
     return HTMLResponse(f"<h3>Artifacts for {job_id}</h3><ul>{lis}</ul>")
+
+async def run_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        return
+
+    url = job["url"]
+    search_text = job["search_text"]
+    webhook_url = job.get("webhook_url") or None
+    job_dir = DATA_DIR / job_id
+
+    # Take screenshot + get text (DOM first, OCR fallback)
+    img_path, text = await screenshot_and_ocr(url, job_dir)
+
+    # Keep a stable pointer for easy viewing
+    try:
+        latest_img = job_dir / "latest.png"
+        if latest_img.exists():
+            latest_img.unlink()
+        shutil.copy(img_path, latest_img)
+    except Exception as e:
+        (job_dir / "latest_copy_error.log").write_text(str(e), encoding="utf-8")
+
+    # Did we find the text?
+    matched = search_text.lower() in text.lower()
+
+    # Update latest.txt
+    summary = (
+        f"Checked: {url}\n"
+        f"At (UTC): {datetime.utcnow().isoformat()}\n"
+        f"Matched: {matched}\n"
+        f"Search text: {search_text}\n"
+    )
+    (job_dir / "latest.txt").write_text(summary, encoding="utf-8")
+
+    # If matched, notify Discord (upload PNG; optionally include a public URL)
+    if matched and webhook_url:
+        # If you have a domain or reverse proxy, set PUBLIC_BASE_URL in your stack/env
+        base = os.getenv("PUBLIC_BASE_URL")
+        external_url = f"{base}/data/{job_id}/{img_path.name}" if base else None
+        try:
+            await notify_discord(
+                webhook_url,
+                f"✅ Match found for '{search_text}' on {url}",
+                image_path=img_path,            # upload file to Discord
+                external_url=external_url       # optional clickable link
+            )
+        except Exception as e:
+            (job_dir / "discord_error.log").write_text(str(e), encoding="utf-8")
+
 
 
 # ---------- Startup ----------

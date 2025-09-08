@@ -72,6 +72,10 @@
               <form method="post" action="/jobs/{{ j.id }}/run-now"><button type="submit">Run now</button></form>
               <form method="post" action="/jobs/{{ j.id }}/delete" onsubmit="return confirm('Delete this job?');"><button type="submit">Delete</button></form>
             </td>
+            <td>
+              <a href="/jobs/{{ j.id }}/files" target="_blank">files</a><br>
+              <a href="/jobs/{{ j.id }}/latest" target="_blank">latest.txt</a>
+            </td>
           </tr>
           {% endfor %}
         </tbody>
