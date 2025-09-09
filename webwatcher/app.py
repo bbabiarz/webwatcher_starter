@@ -28,6 +28,14 @@ DB_PATH = os.environ.get("DB_PATH", "jobs.db")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data")).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# Optional tunables via env:
+# - TZ=America/Toronto
+# - WAIT_SELECTOR=[your CSS or text=...]
+# - WAIT_AFTER_LOAD_MS=10000
+# - PUBLIC_BASE_URL=https://your-domain
+# - CURRENCY_PREFIX=C$   (defaults to C$)
+CURRENCY_PREFIX = os.getenv("CURRENCY_PREFIX", "C$")
+
 logging.basicConfig(level=logging.INFO)
 
 # ---------- App & templating ----------
@@ -56,6 +64,7 @@ def init_db():
             )
             """
         )
+        # migrate: add price_threshold if missing
         cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
         if "price_threshold" not in cols:
             c.execute("ALTER TABLE jobs ADD COLUMN price_threshold REAL")
@@ -107,8 +116,12 @@ def schedule_job(job):
     trigger = IntervalTrigger(minutes=job["minutes"])
     scheduler.add_job(run_job, trigger=trigger, args=[job["id"]], id=job["id"], replace_existing=True)
 
-# ---------- Price extraction ----------
-_PRICE_RE = re.compile(r'(?i)(?:C\$|CA\$|\$|USD|CAD)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)')
+# ---------- Price extraction (C$ only, configurable prefix) ----------
+# Matches:  "C$406"  "C$ 1,234.56"   (NBSP or space allowed)
+_PRICE_RE = re.compile(
+    rf'{re.escape(CURRENCY_PREFIX)}[\s\u00A0]*([0-9]{{1,3}}(?:,[0-9]{{3}})*(?:\.[0-9]{{2}})?)',
+    re.I,
+)
 
 def extract_prices(text: str) -> list[float]:
     vals = []
@@ -138,13 +151,13 @@ async def screenshot_and_ocr(url: str, save_dir: Path) -> tuple[Path, str]:
         try:
             try:
                 await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-                # settle time
+                # Let network settle
                 try:
                     await page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
                     await page.wait_for_timeout(2000)
 
-                # optional target selector
+                # Optional target selector
                 wait_selector = os.getenv("WAIT_SELECTOR", "").strip()
                 if wait_selector:
                     try:
@@ -152,17 +165,18 @@ async def screenshot_and_ocr(url: str, save_dir: Path) -> tuple[Path, str]:
                     except Exception:
                         await page.wait_for_timeout(1000)
 
-                # optional extra delay (ms)
+                # Optional extra delay
                 extra_ms = int(os.getenv("WAIT_AFTER_LOAD_MS", "0"))
                 if extra_ms > 0:
                     await page.wait_for_timeout(extra_ms)
             except Exception:
-                # even if goto fails, try to capture what we can
+                # Even if goto fails, try to capture something
                 await page.wait_for_timeout(3000)
 
+            # Always save a screenshot
             await page.screenshot(path=str(img_path), full_page=True)
 
-            # DOM text first, OCR fallback
+            # Try DOM first, OCR fallback
             dom_text = await page.evaluate("() => document.body.innerText || ''")
             text = dom_text.strip()
             if not text:
@@ -205,7 +219,7 @@ async def run_job(job_id: str):
 
     img_path, text = await screenshot_and_ocr(url, job_dir)
 
-    # latest.png for convenience
+    # Maintain latest.png
     latest_img = job_dir / "latest.png"
     try:
         if latest_img.exists():
@@ -214,26 +228,28 @@ async def run_job(job_id: str):
     except Exception as e:
         (job_dir / "latest_copy_error.log").write_text(str(e), encoding="utf-8")
 
-    # matching
+    # Matching
     text_match = bool(search_text) and (search_text.lower() in text.lower())
     found_prices = extract_prices(text)
     min_price = min(found_prices) if found_prices else None
     price_ok = (min_price is not None and price_threshold is not None and min_price <= float(price_threshold))
     matched = text_match or price_ok
 
-    # summary
+    # Summary
     summary_lines = [
         f"Checked: {url}",
         f"At (UTC): {datetime.utcnow().isoformat()}",
         f"Matched: {matched}",
         f"Search text: {search_text}",
         f"Threshold: {price_threshold if price_threshold is not None else '—'}",
+        f"Currency prefix: {CURRENCY_PREFIX}",
         f"Found prices: {', '.join(f'{p:.2f}' for p in found_prices) if found_prices else 'none'}",
         f"Min price: {min_price:.2f}" if min_price is not None else "Min price: —",
         f"Trigger reason: {'price≤threshold' if price_ok else ('text' if text_match else 'none')}",
     ]
     (job_dir / "latest.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
+    # Discord
     if matched and webhook_url:
         base = os.getenv("PUBLIC_BASE_URL")
         external_url = f"{base}/data/{job_id}/{img_path.name}" if base else None
@@ -278,7 +294,7 @@ def create_job(
 
 @app.post("/jobs/{job_id}/run-now")
 async def run_now(job_id: str):
-    # non-blocking: fire-and-forget
+    # fire-and-forget
     import asyncio
     asyncio.create_task(run_job(job_id))
     return JSONResponse({"ok": True})
@@ -315,6 +331,7 @@ def on_startup():
     for job in list_jobs():
         schedule_job(job)
     scheduler.start()
+    logging.info("Scheduler started")
 
 @app.on_event("shutdown")
 def on_shutdown():
