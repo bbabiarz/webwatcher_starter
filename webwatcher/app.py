@@ -8,7 +8,7 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse
@@ -48,9 +48,13 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.mount("/data", StaticFiles(directory=str(DATA_DIR)), name="data")
 
 # ---------- DB helpers ----------
+def _conn():
+    return sqlite3.connect(DB_PATH)
+
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with _conn() as conn:
         c = conn.cursor()
+        # Create table with sort_order column
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs(
@@ -60,21 +64,39 @@ def init_db():
                 minutes INTEGER NOT NULL,
                 webhook_url TEXT,
                 price_threshold REAL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                sort_order INTEGER
             )
             """
         )
-        # migrate: add price_threshold if missing
+        # Migrations
         cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
         if "price_threshold" not in cols:
             c.execute("ALTER TABLE jobs ADD COLUMN price_threshold REAL")
+        if "sort_order" not in cols:
+            c.execute("ALTER TABLE jobs ADD COLUMN sort_order INTEGER")
+
+        # Seed sort_order for rows that are NULL (keep current visual order: created_at DESC)
+        c.execute("SELECT MAX(sort_order) FROM jobs WHERE sort_order IS NOT NULL")
+        max_order = c.fetchone()[0]
+        if max_order is None:
+            max_order = -1
+        # For all rows with NULL sort_order, assign incrementally by created_at DESC
+        c.execute("SELECT id FROM jobs WHERE sort_order IS NULL ORDER BY created_at DESC")
+        ids = [r[0] for r in c.fetchall()]
+        for i, jid in enumerate(ids, start=max_order + 1):
+            c.execute("UPDATE jobs SET sort_order=? WHERE id=?", (i, jid))
         conn.commit()
 
 def insert_job(job):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _conn() as conn:
         c = conn.cursor()
+        # Append to the end of current order
+        c.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM jobs")
+        next_order = c.fetchone()[0]
         c.execute(
-            "INSERT INTO jobs VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO jobs (id,url,search_text,minutes,webhook_url,price_threshold,created_at,sort_order) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (
                 job["id"],
                 job["url"],
@@ -83,13 +105,14 @@ def insert_job(job):
                 job.get("webhook_url"),
                 job.get("price_threshold"),
                 job["created_at"],
+                next_order,
             ),
         )
         conn.commit()
 
 def update_job_row(job_id: str, url: str, search_text: str, minutes: int,
                    webhook_url: Optional[str], price_threshold: Optional[float]):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _conn() as conn:
         c = conn.cursor()
         c.execute(
             """
@@ -102,13 +125,13 @@ def update_job_row(job_id: str, url: str, search_text: str, minutes: int,
         conn.commit()
 
 def delete_job(job_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _conn() as conn:
         c = conn.cursor()
         c.execute("DELETE FROM jobs WHERE id=?", (job_id,))
         conn.commit()
 
 def get_job(job_id):
-    with sqlite3.connect(DB_PATH) as conn:
+    with _conn() as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
         c.execute("SELECT * FROM jobs WHERE id=?", (job_id,))
@@ -116,12 +139,28 @@ def get_job(job_id):
         return dict(row) if row else None
 
 def list_jobs():
-    with sqlite3.connect(DB_PATH) as conn:
+    with _conn() as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
-        c.execute("SELECT * FROM jobs ORDER BY created_at DESC")
+        # Order: non-NULL sort_order first, by sort_order asc; then NULLs by created_at desc (paranoia)
+        c.execute("""
+            SELECT * FROM jobs
+            ORDER BY sort_order IS NULL, sort_order ASC, created_at DESC
+        """)
         rows = c.fetchall()
         return [dict(r) for r in rows]
+
+def reorder_jobs(order_ids: List[str]):
+    """Persist new order. Any ids not present are appended in existing order."""
+    with _conn() as conn:
+        c = conn.cursor()
+        # Fetch current order to append missing IDs deterministically
+        c.execute("SELECT id FROM jobs ORDER BY sort_order IS NULL, sort_order, created_at DESC")
+        current = [r[0] for r in c.fetchall()]
+        new_order = [jid for jid in order_ids if jid in current] + [jid for jid in current if jid not in order_ids]
+        for idx, jid in enumerate(new_order):
+            c.execute("UPDATE jobs SET sort_order=? WHERE id=?", (idx, jid))
+        conn.commit()
 
 # ---------- Scheduler ----------
 scheduler = AsyncIOScheduler(timezone=os.getenv("TZ", "UTC"))
@@ -131,7 +170,6 @@ def schedule_job(job):
     scheduler.add_job(run_job, trigger=trigger, args=[job["id"]], id=job["id"], replace_existing=True)
 
 def reschedule_job(job_id: str):
-    # Remove then re-add with updated minutes/settings
     try:
         scheduler.remove_job(job_id)
     except Exception:
@@ -328,6 +366,19 @@ def update_job(
     )
     reschedule_job(job_id)
     return RedirectResponse(url="/", status_code=303)
+
+@app.post("/jobs/reorder")
+async def reorder_endpoint(request: Request):
+    try:
+        payload = await request.json()
+        order = payload.get("order", [])
+        if not isinstance(order, list) or not all(isinstance(i, str) for i in order):
+            raise ValueError("Invalid order payload")
+        reorder_jobs(order)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        logging.exception("Failed to reorder")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
 
 @app.post("/jobs", response_class=RedirectResponse)
 def create_job(

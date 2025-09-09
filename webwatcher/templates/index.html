@@ -17,17 +17,24 @@
     .primary { background: black; color: white; }
     .card { border: 1px solid #eee; padding: 16px; border-radius: 14px; margin-top: 20px; }
     table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 8px; border-bottom: 1px solid #f0f0f0; text-align: left; vertical-align: top; }
+    th, td { padding: 8px; border-bottom: 1px solid #f0f0f0; text-align: left; vertical-align: middle; }
     .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .muted { color: #666; font-size: 13px; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    /* Drag styles */
+    th.drag, td.drag { width: 32px; text-align: center; }
+    .drag-handle { cursor: grab; user-select: none; font-size: 18px; line-height: 1; }
+    tr.dragging { opacity: .5; }
+    #toast { position: fixed; right: 16px; bottom: 16px; background: #111; color: #fff; padding: 10px 12px; border-radius: 10px; opacity: 0; transform: translateY(10px); transition: all .25s ease; }
+    #toast.show { opacity: 1; transform: translateY(0); }
   </style>
 </head>
 <body>
   <h1>Web Watcher</h1>
   <p class="muted">
     Poll a webpage on an interval, take a screenshot, extract text (DOM → OCR fallback),
-    and (optionally) ping a Discord webhook when your target text is found or a price is ≤ your threshold.
+    and (optionally) ping a Discord webhook when your target text is found or a C$ price is ≤ your threshold.
+    Drag the rows to reorder how jobs are listed.
   </p>
 
   <form method="post" action="/jobs">
@@ -51,7 +58,7 @@
     <div>
       <label>Notify at or below price (optional)</label>
       <input type="number" name="price_threshold" min="0" step="0.01" placeholder="e.g., 450">
-      <div class="muted">Alert if any detected C$ price ≤ this value.</div>
+      <div class="muted">Alert only when a detected C$ price ≤ this value. If blank, text match is used.</div>
     </div>
 
     <div>
@@ -67,6 +74,7 @@
       <table>
         <thead>
           <tr>
+            <th class="drag">↕</th>
             <th>URL</th>
             <th>Search text</th>
             <th>Price ≤</th>
@@ -76,9 +84,10 @@
             <th>Actions</th>
           </tr>
         </thead>
-        <tbody>
+        <tbody id="jobs-tbody">
           {% for j in jobs %}
-          <tr>
+          <tr data-id="{{ j.id }}">
+            <td class="drag"><span class="drag-handle" draggable="true" title="Drag to reorder">⋮⋮</span></td>
             <td class="mono">{{ j.url }}</td>
             <td class="mono">{{ j.search_text }}</td>
             <td>{{ j.price_threshold or '—' }}</td>
@@ -106,8 +115,74 @@
     <ul>
       <li>Artifacts (screenshots & OCR text) are saved under <span class="mono">/data/&lt;job_id&gt;/</span> and served at <span class="mono">/data</span>.</li>
       <li><span class="mono">latest.png</span> and <span class="mono">latest.txt</span> are refreshed on each run for quick access.</li>
-      <li>Sites behind logins, bot detection, or requiring interaction may need custom steps.</li>
+      <li>Drag the handle (⋮⋮) to reorder jobs; order is saved automatically.</li>
     </ul>
   </div>
+
+  <div id="toast"></div>
+
+  <script>
+    const tbody = document.getElementById('jobs-tbody');
+    const toastEl = document.getElementById('toast');
+    let dragRow = null;
+
+    function toast(msg, isError=false) {
+      toastEl.textContent = msg;
+      toastEl.style.background = isError ? '#b00020' : '#111';
+      toastEl.classList.add('show');
+      setTimeout(()=>toastEl.classList.remove('show'), 1800);
+    }
+
+    tbody.addEventListener('dragstart', (e) => {
+      const handle = e.target.closest('.drag-handle');
+      if (!handle) { e.preventDefault(); return; }
+      dragRow = handle.closest('tr');
+      dragRow.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', dragRow.dataset.id);
+    });
+
+    tbody.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      const targetRow = e.target.closest('tr');
+      if (!dragRow || !targetRow || targetRow === dragRow) return;
+      const rect = targetRow.getBoundingClientRect();
+      const offset = e.clientY - rect.top;
+      const midpoint = rect.height / 2;
+      if (offset > midpoint) {
+        targetRow.after(dragRow);
+      } else {
+        targetRow.before(dragRow);
+      }
+    });
+
+    function saveOrder() {
+      const ids = Array.from(tbody.querySelectorAll('tr')).map(tr => tr.dataset.id);
+      fetch('/jobs/reorder', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ order: ids })
+      }).then(r => {
+        if (r.ok) toast('Order saved');
+        else toast('Failed to save order', true);
+      }).catch(() => toast('Failed to save order', true));
+    }
+
+    tbody.addEventListener('drop', (e) => {
+      e.preventDefault();
+      if (dragRow) {
+        dragRow.classList.remove('dragging');
+        dragRow = null;
+        saveOrder();
+      }
+    });
+
+    tbody.addEventListener('dragend', () => {
+      if (dragRow) {
+        dragRow.classList.remove('dragging');
+        dragRow = null;
+      }
+    });
+  </script>
 </body>
 </html>
