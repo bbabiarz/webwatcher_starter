@@ -1,50 +1,50 @@
 import os
 import uuid
 import sqlite3
+import logging
+import traceback
+import json
+import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import pytesseract
-from PIL import Image
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from apscheduler.schedulers.background import BackgroundScheduler
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-import asyncio
+
 from playwright.async_api import async_playwright
+from PIL import Image
+import pytesseract
 import httpx
-from fastapi.responses import HTMLResponse
-import shutil
-import json
-import re, shutil, json
-
-
-
-
 
 # ---------- Config ----------
 DB_PATH = os.environ.get("DB_PATH", "jobs.db")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data")).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+logging.basicConfig(level=logging.INFO)
+
 # ---------- App & templating ----------
 app = FastAPI(title="Web Watcher")
 templates = Jinja2Templates(directory="templates")
+
 STATIC_DIR = Path("static")
-STATIC_DIR.mkdir(parents=True, exist_ok=True)  # ensure it exists
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-app.mount("/static", StaticFiles(directory="static"), name="static")
 app.mount("/data", StaticFiles(directory=str(DATA_DIR)), name="data")
 
 # ---------- DB helpers ----------
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        # create (new installs)
-        c.execute("""
+        c.execute(
+            """
             CREATE TABLE IF NOT EXISTS jobs(
                 id TEXT PRIMARY KEY,
                 url TEXT NOT NULL,
@@ -54,22 +54,29 @@ def init_db():
                 price_threshold REAL,
                 created_at TEXT NOT NULL
             )
-        """)
-        # migrate (existing DBs that lack price_threshold)
+            """
+        )
         cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
         if "price_threshold" not in cols:
             c.execute("ALTER TABLE jobs ADD COLUMN price_threshold REAL")
         conn.commit()
 
-
 def insert_job(job):
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?)",
-                  (job["id"], job["url"], job["search_text"], job["minutes"],
-                   job.get("webhook_url"), job.get("price_threshold"), job["created_at"]))
+        c.execute(
+            "INSERT INTO jobs VALUES(?,?,?,?,?,?,?)",
+            (
+                job["id"],
+                job["url"],
+                job["search_text"],
+                job["minutes"],
+                job.get("webhook_url"),
+                job.get("price_threshold"),
+                job["created_at"],
+            ),
+        )
         conn.commit()
-
 
 def delete_job(job_id):
     with sqlite3.connect(DB_PATH) as conn:
@@ -92,51 +99,16 @@ def list_jobs():
         c.execute("SELECT * FROM jobs ORDER BY created_at DESC")
         rows = c.fetchall()
         return [dict(r) for r in rows]
-    
-from fastapi.responses import JSONResponse
-import asyncio
 
-@app.post("/jobs/{job_id}/run-now")
-async def run_now(job_id: str):
-    asyncio.create_task(run_job(job_id))  # fire-and-forget
-    return JSONResponse({"ok": True})
+# ---------- Scheduler ----------
+scheduler = AsyncIOScheduler(timezone=os.getenv("TZ", "UTC"))
 
-@app.get("/jobs/{job_id}/files", response_class=HTMLResponse)
-def list_files(job_id: str):
-    job_dir = DATA_DIR / job_id
-    if not job_dir.exists():
-        return HTMLResponse("<p>No files yet.</p>", status_code=404)
-    items = sorted(job_dir.iterdir(), reverse=True)
-    lis = "".join(f'<li><a href="/data/{job_id}/{p.name}">{p.name}</a></li>' for p in items)
-    return HTMLResponse(f"<h3>Artifacts for {job_id}</h3><ul>{lis}</ul>")
+def schedule_job(job):
+    trigger = IntervalTrigger(minutes=job["minutes"])
+    scheduler.add_job(run_job, trigger=trigger, args=[job["id"]], id=job["id"], replace_existing=True)
 
-from typing import Optional
-from fastapi import Form
-
-@app.post("/jobs", response_class=RedirectResponse)
-def create_job(url: str = Form(...),
-               search_text: str = Form(...),
-               minutes: int = Form(...),
-               webhook_url: Optional[str] = Form(None),
-               price_threshold: Optional[float] = Form(None)):
-    if minutes < 1:
-        raise HTTPException(400, "Minutes must be >= 1")
-    job = {
-        "id": str(uuid.uuid4()),
-        "url": url.strip(),
-        "search_text": search_text.strip(),
-        "minutes": minutes,
-        "webhook_url": webhook_url.strip() if webhook_url else None,
-        "price_threshold": float(price_threshold) if price_threshold not in (None, "") else None,
-        "created_at": datetime.utcnow().isoformat()
-    }
-    insert_job(job)
-    schedule_job(job)
-    return RedirectResponse(url="/", status_code=303)
-
-_PRICE_RE = re.compile(
-    r'(?i)(?:C\$|CA\$|\$|USD|CAD)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)'
-)
+# ---------- Price extraction ----------
+_PRICE_RE = re.compile(r'(?i)(?:C\$|CA\$|\$|USD|CAD)\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})?)')
 
 def extract_prices(text: str) -> list[float]:
     vals = []
@@ -148,21 +120,7 @@ def extract_prices(text: str) -> list[float]:
             pass
     return vals
 
-
-
-# ---------- Scheduler ----------
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-scheduler = AsyncIOScheduler(timezone=os.getenv("TZ", "UTC"))
-
-def schedule_job(job):
-    trigger = IntervalTrigger(minutes=job["minutes"])
-    # target the coroutine directly (AsyncIOScheduler will await it)
-    scheduler.add_job(run_job, trigger=trigger, args=[job["id"]],
-                      id=job["id"], replace_existing=True)
-
-import logging, traceback
-logging.basicConfig(level=logging.INFO)
-
+# ---------- Core actions ----------
 async def screenshot_and_ocr(url: str, save_dir: Path) -> tuple[Path, str]:
     save_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -178,45 +136,36 @@ async def screenshot_and_ocr(url: str, save_dir: Path) -> tuple[Path, str]:
         )
         page = await context.new_page()
         try:
-            # Load page; be tolerant to failures but still take a screenshot
             try:
                 await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-                
-                # Wait for page to really settle, then optional extra delay / selector
+                # settle time
                 try:
                     await page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
-                    # keep going even if network never goes fully idle
                     await page.wait_for_timeout(2000)
 
-                # Optional: wait for a specific element to appear (from env WAIT_SELECTOR)
+                # optional target selector
                 wait_selector = os.getenv("WAIT_SELECTOR", "").strip()
                 if wait_selector:
                     try:
                         await page.wait_for_selector(wait_selector, timeout=15000)
                     except Exception:
-                        # don't fail the run just because the selector wasn't found in time
                         await page.wait_for_timeout(1000)
 
-                # Optional: fixed extra delay in ms (from env WAIT_AFTER_LOAD_MS)
+                # optional extra delay (ms)
                 extra_ms = int(os.getenv("WAIT_AFTER_LOAD_MS", "0"))
                 if extra_ms > 0:
                     await page.wait_for_timeout(extra_ms)
-
-                
             except Exception:
-                # fall back: give the page a moment even if goto errored
+                # even if goto fails, try to capture what we can
                 await page.wait_for_timeout(3000)
 
-            # Always capture a full-page PNG for debugging/notifications
             await page.screenshot(path=str(img_path), full_page=True)
 
-            # Try DOM text first (faster & cleaner than OCR)
+            # DOM text first, OCR fallback
             dom_text = await page.evaluate("() => document.body.innerText || ''")
             text = dom_text.strip()
             if not text:
-                from PIL import Image
-                import pytesseract
                 text = pytesseract.image_to_string(Image.open(img_path))
 
         except Exception:
@@ -232,6 +181,17 @@ async def screenshot_and_ocr(url: str, save_dir: Path) -> tuple[Path, str]:
     text_path.write_text(text, encoding="utf-8")
     return img_path, text
 
+async def notify_discord(webhook_url: str, content: str, image_path: Optional[Path] = None, external_url: Optional[str] = None):
+    async with httpx.AsyncClient(timeout=30) as client:
+        if image_path and image_path.exists():
+            payload = {"content": content, "embeds": [{"image": {"url": f"attachment://{image_path.name}"}}]}
+            files = {"file": (image_path.name, image_path.read_bytes(), "image/png")}
+            r = await client.post(webhook_url, data={"payload_json": json.dumps(payload)}, files=files)
+        else:
+            payload = {"content": f"{content}\n{external_url}" if external_url else content}
+            r = await client.post(webhook_url, json=payload)
+        r.raise_for_status()
+
 async def run_job(job_id: str):
     job = get_job(job_id)
     if not job:
@@ -245,7 +205,7 @@ async def run_job(job_id: str):
 
     img_path, text = await screenshot_and_ocr(url, job_dir)
 
-    # Maintain a stable pointer
+    # latest.png for convenience
     latest_img = job_dir / "latest.png"
     try:
         if latest_img.exists():
@@ -254,30 +214,26 @@ async def run_job(job_id: str):
     except Exception as e:
         (job_dir / "latest_copy_error.log").write_text(str(e), encoding="utf-8")
 
-    # Text match (old behavior)
-    text_match = search_text.lower() in text.lower() if search_text else False
-
-    # Price match (new behavior)
+    # matching
+    text_match = bool(search_text) and (search_text.lower() in text.lower())
     found_prices = extract_prices(text)
     min_price = min(found_prices) if found_prices else None
     price_ok = (min_price is not None and price_threshold is not None and min_price <= float(price_threshold))
+    matched = text_match or price_ok
 
-    matched = bool(text_match or price_ok)
-
-    # Update latest.txt
+    # summary
     summary_lines = [
         f"Checked: {url}",
         f"At (UTC): {datetime.utcnow().isoformat()}",
         f"Matched: {matched}",
         f"Search text: {search_text}",
         f"Threshold: {price_threshold if price_threshold is not None else '—'}",
-        f"Found prices: {', '.join(map(lambda p: f'{p:.2f}', found_prices)) if found_prices else 'none'}",
+        f"Found prices: {', '.join(f'{p:.2f}' for p in found_prices) if found_prices else 'none'}",
         f"Min price: {min_price:.2f}" if min_price is not None else "Min price: —",
         f"Trigger reason: {'price≤threshold' if price_ok else ('text' if text_match else 'none')}",
     ]
     (job_dir / "latest.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
-    # Notify Discord with file upload (works without public URL)
     if matched and webhook_url:
         base = os.getenv("PUBLIC_BASE_URL")
         external_url = f"{base}/data/{job_id}/{img_path.name}" if base else None
@@ -292,48 +248,29 @@ async def run_job(job_id: str):
         except Exception as e:
             (job_dir / "discord_error.log").write_text(str(e), encoding="utf-8")
 
-
-async def notify_discord(webhook_url: str, content: str, image_path: Optional[Path] = None, external_url: Optional[str] = None):
-    async with httpx.AsyncClient(timeout=30) as client:
-        if image_path and image_path.exists():
-            payload = {
-                "content": content,
-                "embeds": [{"image": {"url": f"attachment://{image_path.name}"}}]
-            }
-            files = {"file": (image_path.name, image_path.read_bytes(), "image/png")}
-            r = await client.post(webhook_url, data={"payload_json": json.dumps(payload)}, files=files)
-        else:
-            # fallback: just send text (optionally include an external URL)
-            payload = {"content": f"{content}\n{external_url}" if external_url else content}
-            r = await client.post(webhook_url, json=payload)
-        r.raise_for_status()
-
-
-def run_job_sync(job_id: str):
-    asyncio.run(run_job(job_id))
-
-
-
 # ---------- Routes ----------
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    rows = list_jobs()
-    return templates.TemplateResponse("index.html", {"request": request, "jobs": rows})
+    return templates.TemplateResponse("index.html", {"request": request, "jobs": list_jobs()})
 
 @app.post("/jobs", response_class=RedirectResponse)
-def create_job(url: str = Form(...),
-               search_text: str = Form(...),
-               minutes: int = Form(...),
-               webhook_url: Optional[str] = Form(None)):
+def create_job(
+    url: str = Form(...),
+    search_text: str = Form(""),
+    minutes: int = Form(...),
+    webhook_url: Optional[str] = Form(None),
+    price_threshold: Optional[float] = Form(None),
+):
     if minutes < 1:
         raise HTTPException(400, "Minutes must be >= 1")
     job = {
         "id": str(uuid.uuid4()),
         "url": url.strip(),
-        "search_text": search_text.strip(),
+        "search_text": (search_text or "").strip(),
         "minutes": minutes,
         "webhook_url": webhook_url.strip() if webhook_url else None,
-        "created_at": datetime.utcnow().isoformat()
+        "price_threshold": float(price_threshold) if price_threshold not in (None, "") else None,
+        "created_at": datetime.utcnow().isoformat(),
     }
     insert_job(job)
     schedule_job(job)
@@ -341,7 +278,9 @@ def create_job(url: str = Form(...),
 
 @app.post("/jobs/{job_id}/run-now")
 async def run_now(job_id: str):
-    await run_job(job_id)
+    # non-blocking: fire-and-forget
+    import asyncio
+    asyncio.create_task(run_job(job_id))
     return JSONResponse({"ok": True})
 
 @app.post("/jobs/{job_id}/delete", response_class=RedirectResponse)
@@ -351,18 +290,14 @@ def remove_job(job_id: str):
     except Exception:
         pass
     delete_job(job_id)
-    # Optionally keep artifacts in data/
     return RedirectResponse(url="/", status_code=303)
 
 @app.get("/jobs/{job_id}/latest", response_class=FileResponse)
 def latest_text(job_id: str):
-    job_dir = DATA_DIR / job_id
-    f = job_dir / "latest.txt"
+    f = (DATA_DIR / job_id) / "latest.txt"
     if f.exists():
         return FileResponse(str(f))
     raise HTTPException(404, "No latest summary yet.")
-
-from fastapi.responses import HTMLResponse
 
 @app.get("/jobs/{job_id}/files", response_class=HTMLResponse)
 def list_files(job_id: str):
@@ -373,62 +308,10 @@ def list_files(job_id: str):
     lis = "".join(f'<li><a href="/data/{job_id}/{p.name}">{p.name}</a></li>' for p in items)
     return HTMLResponse(f"<h3>Artifacts for {job_id}</h3><ul>{lis}</ul>")
 
-async def run_job(job_id: str):
-    job = get_job(job_id)
-    if not job:
-        return
-
-    url = job["url"]
-    search_text = job["search_text"]
-    webhook_url = job.get("webhook_url") or None
-    job_dir = DATA_DIR / job_id
-
-    # Take screenshot + get text (DOM first, OCR fallback)
-    img_path, text = await screenshot_and_ocr(url, job_dir)
-
-    # Keep a stable pointer for easy viewing
-    try:
-        latest_img = job_dir / "latest.png"
-        if latest_img.exists():
-            latest_img.unlink()
-        shutil.copy(img_path, latest_img)
-    except Exception as e:
-        (job_dir / "latest_copy_error.log").write_text(str(e), encoding="utf-8")
-
-    # Did we find the text?
-    matched = search_text.lower() in text.lower()
-
-    # Update latest.txt
-    summary = (
-        f"Checked: {url}\n"
-        f"At (UTC): {datetime.utcnow().isoformat()}\n"
-        f"Matched: {matched}\n"
-        f"Search text: {search_text}\n"
-    )
-    (job_dir / "latest.txt").write_text(summary, encoding="utf-8")
-
-    # If matched, notify Discord (upload PNG; optionally include a public URL)
-    if matched and webhook_url:
-        # If you have a domain or reverse proxy, set PUBLIC_BASE_URL in your stack/env
-        base = os.getenv("PUBLIC_BASE_URL")
-        external_url = f"{base}/data/{job_id}/{img_path.name}" if base else None
-        try:
-            await notify_discord(
-                webhook_url,
-                f"✅ Match found for '{search_text}' on {url}",
-                image_path=img_path,            # upload file to Discord
-                external_url=external_url       # optional clickable link
-            )
-        except Exception as e:
-            (job_dir / "discord_error.log").write_text(str(e), encoding="utf-8")
-
-
-
-# ---------- Startup ----------
+# ---------- Startup / Shutdown ----------
 @app.on_event("startup")
 def on_startup():
     init_db()
-    # reload jobs
     for job in list_jobs():
         schedule_job(job)
     scheduler.start()

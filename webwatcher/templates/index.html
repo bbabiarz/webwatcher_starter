@@ -17,7 +17,7 @@
     .primary { background: black; color: white; }
     .card { border: 1px solid #eee; padding: 16px; border-radius: 14px; margin-top: 20px; }
     table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 8px; border-bottom: 1px solid #f0f0f0; text-align: left; }
+    th, td { padding: 8px; border-bottom: 1px solid #f0f0f0; text-align: left; vertical-align: top; }
     .row-actions { display: flex; gap: 8px; }
     .muted { color: #666; font-size: 13px; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
@@ -25,7 +25,10 @@
 </head>
 <body>
   <h1>Web Watcher</h1>
-  <p class="muted">Poll a webpage on an interval, take a screenshot, OCR the contents, and (optionally) ping a Discord webhook if text is found.</p>
+  <p class="muted">
+    Poll a webpage on an interval, take a screenshot, extract text (DOM → OCR fallback),
+    and (optionally) ping a Discord webhook when your target text is found or a price is ≤ your threshold.
+  </p>
 
   <form method="post" action="/jobs">
     <div>
@@ -33,8 +36,8 @@
       <input type="url" name="url" placeholder="https://example.com" required>
     </div>
     <div>
-      <label>Text to watch for</label>
-      <input name="search_text" placeholder="e.g., 'Registration open' or 'Sold out'" required>
+      <label>Text to watch for (optional)</label>
+      <input name="search_text" placeholder="e.g., 'Registration open' or 'Sold out'">
     </div>
     <div>
       <label>Frequency (minutes)</label>
@@ -62,25 +65,33 @@
       <p class="muted">No jobs yet — add one above.</p>
     {% else %}
       <table>
-        <thead><tr><th>URL</th><th>Search text</th><th>Every</th><th>Created</th><th>Artifacts</th><th>Actions</th></tr></thead>
+        <thead>
+          <tr>
+            <th>URL</th>
+            <th>Search text</th>
+            <th>Price ≤</th>
+            <th>Every</th>
+            <th>Created</th>
+            <th>Artifacts</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
         <tbody>
           {% for j in jobs %}
           <tr>
             <td class="mono">{{ j.url }}</td>
             <td class="mono">{{ j.search_text }}</td>
+            <td>{{ j.price_threshold or '—' }}</td>
             <td>{{ j.minutes }} min</td>
             <td class="muted">{{ j.created_at }}</td>
             <td>
-              <a href="/data/{{ j.id }}/" target="_blank">/data/{{ j.id }}/</a><br>
+              <a href="/jobs/{{ j.id }}/files" target="_blank">files</a><br>
+              <a href="/data/{{ j.id }}/latest.png" target="_blank">latest.png</a><br>
               <a href="/jobs/{{ j.id }}/latest" target="_blank">latest.txt</a>
             </td>
             <td class="row-actions">
               <form method="post" action="/jobs/{{ j.id }}/run-now"><button type="submit">Run now</button></form>
               <form method="post" action="/jobs/{{ j.id }}/delete" onsubmit="return confirm('Delete this job?');"><button type="submit">Delete</button></form>
-            </td>
-            <td>
-              <a href="/jobs/{{ j.id }}/files" target="_blank">files</a><br>
-              <a href="/jobs/{{ j.id }}/latest" target="_blank">latest.txt</a>
             </td>
           </tr>
           {% endfor %}
@@ -93,8 +104,8 @@
     <h3>Notes</h3>
     <ul>
       <li>Artifacts (screenshots & OCR text) are saved under <span class="mono">/data/&lt;job_id&gt;/</span> and served at <span class="mono">/data</span>.</li>
-      <li>Discord notifications include a link to the latest screenshot when a match is found.</li>
-      <li>Sites behind logins, heavy bot detection, or requiring interaction may need custom steps. This starter polls a public URL.</li>
+      <li><span class="mono">latest.png</span> and <span class="mono">latest.txt</span> are refreshed on each run for quick access.</li>
+      <li>Sites behind logins, bot detection, or requiring interaction may need custom steps.</li>
     </ul>
   </div>
 </body>
