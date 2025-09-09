@@ -21,12 +21,18 @@
     .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .muted { color: #666; font-size: 13px; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+
     /* Drag styles */
     th.drag, td.drag { width: 32px; text-align: center; }
     .drag-handle { cursor: grab; user-select: none; font-size: 18px; line-height: 1; }
     tr.dragging { opacity: .5; }
+
+    /* Toast */
     #toast { position: fixed; right: 16px; bottom: 16px; background: #111; color: #fff; padding: 10px 12px; border-radius: 10px; opacity: 0; transform: translateY(10px); transition: all .25s ease; }
     #toast.show { opacity: 1; transform: translateY(0); }
+
+    /* Buttons */
+    .run-now[disabled] { opacity: .6; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -100,7 +106,7 @@
             </td>
             <td class="row-actions">
               <a href="/jobs/{{ j.id }}/edit"><button type="button">Edit</button></a>
-              <form method="post" action="/jobs/{{ j.id }}/run-now"><button type="submit">Run now</button></form>
+              <button class="run-now" type="button" data-id="{{ j.id }}">Run now</button>
               <form method="post" action="/jobs/{{ j.id }}/delete" onsubmit="return confirm('Delete this job?');"><button type="submit">Delete</button></form>
             </td>
           </tr>
@@ -130,9 +136,10 @@
       toastEl.textContent = msg;
       toastEl.style.background = isError ? '#b00020' : '#111';
       toastEl.classList.add('show');
-      setTimeout(()=>toastEl.classList.remove('show'), 1800);
+      setTimeout(()=>toastEl.classList.remove('show'), 1600);
     }
 
+    // ---- Drag & drop ordering ----
     tbody.addEventListener('dragstart', (e) => {
       const handle = e.target.closest('.drag-handle');
       if (!handle) { e.preventDefault(); return; }
@@ -182,6 +189,26 @@
         dragRow.classList.remove('dragging');
         dragRow = null;
       }
+    });
+
+    // ---- Run now (AJAX) ----
+    tbody.addEventListener('click', (e) => {
+      const btn = e.target.closest('.run-now');
+      if (!btn) return;
+
+      const jobId = btn.dataset.id;
+      btn.disabled = true;
+      const prevText = btn.textContent;
+      btn.textContent = 'Running…';
+
+      fetch(`/jobs/${jobId}/run-now`, { method: 'POST' })
+        .then(r => r.ok ? r.json() : Promise.reject())
+        .then(() => { toast('Job started'); })
+        .catch(() => { toast('Failed to start job', true); })
+        .finally(() => {
+          btn.disabled = false;
+          btn.textContent = prevText;
+        });
     });
   </script>
 </body>
