@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Edit Job</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans"; margin: 24px; }
+    h1 { font-size: 22px; }
+    form { display: grid; gap: 12px; max-width: 720px; }
+    label { font-weight: 600; }
+    input { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 10px; }
+    button { padding: 10px 14px; border-radius: 10px; border: 0; cursor: pointer; }
+    .primary { background: black; color: white; }
+    .row { display: flex; gap: 8px; }
+    .muted { color: #666; font-size: 13px; }
+    a { text-decoration: none; }
+  </style>
+</head>
+<body>
+  <h1>Edit Job</h1>
+  <p class="muted">Update fields and save. The schedule will be updated immediately.</p>
+
+  <form method="post" action="/jobs/{{ job.id }}/update">
+    <div>
+      <label>Website URL</label>
+      <input type="url" name="url" value="{{ job.url }}" required>
+    </div>
+    <div>
+      <label>Text to watch for (optional)</label>
+      <input name="search_text" value="{{ job.search_text }}">
+    </div>
+    <div>
+      <label>Frequency (minutes)</label>
+      <input type="number" name="minutes" min="1" value="{{ job.minutes }}" required>
+    </div>
+    <div>
+      <label>Discord Webhook URL (optional)</label>
+      <input type="url" name="webhook_url" value="{{ job.webhook_url }}">
+    </div>
+    <div>
+      <label>Notify at or below price (optional)</label>
+      <input type="number" name="price_threshold" min="0" step="0.01" value="{{ job.price_threshold if job.price_threshold is not none }}">
+      <div class="muted">Alert only when a detected C$ price ≤ this value. If blank, text match is used.</div>
+    </div>
+
+    <div class="row">
+      <button class="primary" type="submit">Save changes</button>
+      <a href="/"><button type="button">Cancel</button></a>
+    </div>
+  </form>
+</body>
+</html>

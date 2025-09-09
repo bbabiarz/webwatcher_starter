@@ -87,6 +87,20 @@ def insert_job(job):
         )
         conn.commit()
 
+def update_job_row(job_id: str, url: str, search_text: str, minutes: int,
+                   webhook_url: Optional[str], price_threshold: Optional[float]):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            UPDATE jobs
+               SET url = ?, search_text = ?, minutes = ?, webhook_url = ?, price_threshold = ?
+             WHERE id = ?
+            """,
+            (url, search_text, minutes, webhook_url, price_threshold, job_id),
+        )
+        conn.commit()
+
 def delete_job(job_id):
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
@@ -115,6 +129,16 @@ scheduler = AsyncIOScheduler(timezone=os.getenv("TZ", "UTC"))
 def schedule_job(job):
     trigger = IntervalTrigger(minutes=job["minutes"])
     scheduler.add_job(run_job, trigger=trigger, args=[job["id"]], id=job["id"], replace_existing=True)
+
+def reschedule_job(job_id: str):
+    # Remove then re-add with updated minutes/settings
+    try:
+        scheduler.remove_job(job_id)
+    except Exception:
+        pass
+    updated = get_job(job_id)
+    if updated:
+        schedule_job(updated)
 
 # ---------- Price extraction (C$ only by default) ----------
 # Matches: "C$406" or "C$ 1,234.56" (space or NBSP allowed)
@@ -234,9 +258,7 @@ async def run_job(job_id: str):
     min_price = min(found_prices) if found_prices else None
     price_ok = (min_price is not None and price_threshold is not None and min_price <= float(price_threshold))
 
-    # --- NOTIFY LOGIC ---
-    # If a price_threshold is set: ONLY price condition can trigger notifications.
-    # If no threshold is set: ONLY text match can trigger notifications.
+    # Notify logic (price-gated if threshold set)
     if price_threshold is not None:
         matched_for_notify = price_ok
         trigger_reason = "price≤threshold" if price_ok else "none"
@@ -277,6 +299,35 @@ async def run_job(job_id: str):
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request, "jobs": list_jobs()})
+
+@app.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
+def edit_job(job_id: str, request: Request):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return templates.TemplateResponse("edit.html", {"request": request, "job": job})
+
+@app.post("/jobs/{job_id}/update", response_class=RedirectResponse)
+def update_job(
+    job_id: str,
+    url: str = Form(...),
+    search_text: str = Form(""),
+    minutes: int = Form(...),
+    webhook_url: Optional[str] = Form(None),
+    price_threshold: Optional[float] = Form(None),
+):
+    if minutes < 1:
+        raise HTTPException(400, "Minutes must be >= 1")
+    update_job_row(
+        job_id=job_id,
+        url=url.strip(),
+        search_text=(search_text or "").strip(),
+        minutes=int(minutes),
+        webhook_url=webhook_url.strip() if webhook_url else None,
+        price_threshold=float(price_threshold) if price_threshold not in (None, "") else None,
+    )
+    reschedule_job(job_id)
+    return RedirectResponse(url="/", status_code=303)
 
 @app.post("/jobs", response_class=RedirectResponse)
 def create_job(
