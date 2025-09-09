@@ -28,12 +28,12 @@ DB_PATH = os.environ.get("DB_PATH", "jobs.db")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data")).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Optional tunables via env:
-# - TZ=America/Toronto
-# - WAIT_SELECTOR=[your CSS or text=...]
-# - WAIT_AFTER_LOAD_MS=10000
-# - PUBLIC_BASE_URL=https://your-domain
-# - CURRENCY_PREFIX=C$   (defaults to C$)
+# Optional env:
+#   TZ=America/Toronto
+#   WAIT_SELECTOR=[css or text=...]
+#   WAIT_AFTER_LOAD_MS=10000
+#   PUBLIC_BASE_URL=https://your-domain
+#   CURRENCY_PREFIX=C$   (defaults to "C$")
 CURRENCY_PREFIX = os.getenv("CURRENCY_PREFIX", "C$")
 
 logging.basicConfig(level=logging.INFO)
@@ -116,8 +116,8 @@ def schedule_job(job):
     trigger = IntervalTrigger(minutes=job["minutes"])
     scheduler.add_job(run_job, trigger=trigger, args=[job["id"]], id=job["id"], replace_existing=True)
 
-# ---------- Price extraction (C$ only, configurable prefix) ----------
-# Matches:  "C$406"  "C$ 1,234.56"   (NBSP or space allowed)
+# ---------- Price extraction (C$ only by default) ----------
+# Matches: "C$406" or "C$ 1,234.56" (space or NBSP allowed)
 _PRICE_RE = re.compile(
     rf'{re.escape(CURRENCY_PREFIX)}[\s\u00A0]*([0-9]{{1,3}}(?:,[0-9]{{3}})*(?:\.[0-9]{{2}})?)',
     re.I,
@@ -228,33 +228,42 @@ async def run_job(job_id: str):
     except Exception as e:
         (job_dir / "latest_copy_error.log").write_text(str(e), encoding="utf-8")
 
-    # Matching
+    # Evaluate matches
     text_match = bool(search_text) and (search_text.lower() in text.lower())
     found_prices = extract_prices(text)
     min_price = min(found_prices) if found_prices else None
     price_ok = (min_price is not None and price_threshold is not None and min_price <= float(price_threshold))
-    matched = text_match or price_ok
+
+    # --- NOTIFY LOGIC ---
+    # If a price_threshold is set: ONLY price condition can trigger notifications.
+    # If no threshold is set: ONLY text match can trigger notifications.
+    if price_threshold is not None:
+        matched_for_notify = price_ok
+        trigger_reason = "price≤threshold" if price_ok else "none"
+    else:
+        matched_for_notify = text_match
+        trigger_reason = "text" if text_match else "none"
 
     # Summary
     summary_lines = [
         f"Checked: {url}",
         f"At (UTC): {datetime.utcnow().isoformat()}",
-        f"Matched: {matched}",
+        f"Notify condition: {'price≤threshold' if price_threshold is not None else 'text match'}",
+        f"Matched (notify): {matched_for_notify}",
         f"Search text: {search_text}",
         f"Threshold: {price_threshold if price_threshold is not None else '—'}",
         f"Currency prefix: {CURRENCY_PREFIX}",
         f"Found prices: {', '.join(f'{p:.2f}' for p in found_prices) if found_prices else 'none'}",
         f"Min price: {min_price:.2f}" if min_price is not None else "Min price: —",
-        f"Trigger reason: {'price≤threshold' if price_ok else ('text' if text_match else 'none')}",
+        f"Trigger reason: {trigger_reason}",
     ]
     (job_dir / "latest.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
 
-    # Discord
-    if matched and webhook_url:
+    # Notify (price-gated or text-only as configured)
+    if matched_for_notify and webhook_url:
         base = os.getenv("PUBLIC_BASE_URL")
         external_url = f"{base}/data/{job_id}/{img_path.name}" if base else None
-        reason = "price ≤ threshold" if price_ok else "text match"
-        msg = f"✅ Match ({reason}) for '{search_text}' on {url}"
+        msg = f"✅ Match ({trigger_reason}) for '{search_text}' on {url}"
         if min_price is not None:
             msg += f"\nLowest detected price: {min_price:.2f}"
             if price_threshold is not None:
