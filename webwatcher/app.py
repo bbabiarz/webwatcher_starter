@@ -51,60 +51,40 @@ app.mount("/data", StaticFiles(directory=str(DATA_DIR)), name="data")
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        # New table shape: id, title, url, search_text, minutes, webhook_url, price_threshold, created_at, last_run_at
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs(
                 id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
                 url TEXT NOT NULL,
                 search_text TEXT NOT NULL,
                 minutes INTEGER NOT NULL,
                 webhook_url TEXT,
                 price_threshold REAL,
-                created_at TEXT NOT NULL,
-                last_run_at TEXT
+                created_at TEXT NOT NULL
             )
             """
         )
-        # Migrate older DBs
+        # migrate: add price_threshold if missing
         cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
-        if "title" not in cols:
-            c.execute("ALTER TABLE jobs ADD COLUMN title TEXT")
-            c.execute("UPDATE jobs SET title = COALESCE(title, '')")
         if "price_threshold" not in cols:
             c.execute("ALTER TABLE jobs ADD COLUMN price_threshold REAL")
-        if "last_run_at" not in cols:
-            c.execute("ALTER TABLE jobs ADD COLUMN last_run_at TEXT")
         conn.commit()
 
 def insert_job(job):
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute(
-            """
-            INSERT INTO jobs
-            (id, title, url, search_text, minutes, webhook_url, price_threshold, created_at, last_run_at)
-            VALUES (?,?,?,?,?,?,?,?,?)
-            """,
+            "INSERT INTO jobs VALUES(?,?,?,?,?,?,?)",
             (
                 job["id"],
-                job["title"],
                 job["url"],
                 job["search_text"],
                 job["minutes"],
                 job.get("webhook_url"),
                 job.get("price_threshold"),
                 job["created_at"],
-                job.get("last_run_at"),
             ),
         )
-        conn.commit()
-
-def update_last_run(job_id: str, when_iso: str):
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("UPDATE jobs SET last_run_at=? WHERE id=?", (when_iso, job_id))
         conn.commit()
 
 def delete_job(job_id):
@@ -177,7 +157,7 @@ async def screenshot_and_ocr(url: str, save_dir: Path) -> tuple[Path, str]:
                 except Exception:
                     await page.wait_for_timeout(2000)
 
-                # Optional selector
+                # Optional target selector
                 wait_selector = os.getenv("WAIT_SELECTOR", "").strip()
                 if wait_selector:
                     try:
@@ -190,6 +170,7 @@ async def screenshot_and_ocr(url: str, save_dir: Path) -> tuple[Path, str]:
                 if extra_ms > 0:
                     await page.wait_for_timeout(extra_ms)
             except Exception:
+                # Even if goto fails, try to capture something
                 await page.wait_for_timeout(3000)
 
             # Always save a screenshot
@@ -231,7 +212,6 @@ async def run_job(job_id: str):
         return
 
     url = job["url"]
-    title = job.get("title") or ""
     search_text = job["search_text"]
     webhook_url = job.get("webhook_url") or None
     price_threshold = job.get("price_threshold")
@@ -254,7 +234,9 @@ async def run_job(job_id: str):
     min_price = min(found_prices) if found_prices else None
     price_ok = (min_price is not None and price_threshold is not None and min_price <= float(price_threshold))
 
-    # Notify logic (price gate)
+    # --- NOTIFY LOGIC ---
+    # If a price_threshold is set: ONLY price condition can trigger notifications.
+    # If no threshold is set: ONLY text match can trigger notifications.
     if price_threshold is not None:
         matched_for_notify = price_ok
         trigger_reason = "price≤threshold" if price_ok else "none"
@@ -262,15 +244,10 @@ async def run_job(job_id: str):
         matched_for_notify = text_match
         trigger_reason = "text" if text_match else "none"
 
-    # Update last_run_at ASAP
-    now_iso = datetime.utcnow().isoformat()
-    update_last_run(job_id, now_iso)
-
     # Summary
     summary_lines = [
-        f"Title: {title}",
         f"Checked: {url}",
-        f"At (UTC): {now_iso}",
+        f"At (UTC): {datetime.utcnow().isoformat()}",
         f"Notify condition: {'price≤threshold' if price_threshold is not None else 'text match'}",
         f"Matched (notify): {matched_for_notify}",
         f"Search text: {search_text}",
@@ -286,12 +263,11 @@ async def run_job(job_id: str):
     if matched_for_notify and webhook_url:
         base = os.getenv("PUBLIC_BASE_URL")
         external_url = f"{base}/data/{job_id}/{img_path.name}" if base else None
-        title_prefix = f"[{title}] " if title else ""
-        msg = f"{title_prefix}✅ Match ({trigger_reason}) on {url}"
+        msg = f"✅ Match ({trigger_reason}) for '{search_text}' on {url}"
         if min_price is not None:
-            msg += f"\nLowest detected {CURRENCY_PREFIX}{min_price:.2f}"
+            msg += f"\nLowest detected price: {min_price:.2f}"
             if price_threshold is not None:
-                msg += f" (threshold: {CURRENCY_PREFIX}{float(price_threshold):.2f})"
+                msg += f" (threshold: {float(price_threshold):.2f})"
         try:
             await notify_discord(webhook_url, msg, image_path=img_path, external_url=external_url)
         except Exception as e:
@@ -304,7 +280,6 @@ def index(request: Request):
 
 @app.post("/jobs", response_class=RedirectResponse)
 def create_job(
-    title: str = Form(...),
     url: str = Form(...),
     search_text: str = Form(""),
     minutes: int = Form(...),
@@ -315,14 +290,12 @@ def create_job(
         raise HTTPException(400, "Minutes must be >= 1")
     job = {
         "id": str(uuid.uuid4()),
-        "title": title.strip(),
         "url": url.strip(),
         "search_text": (search_text or "").strip(),
         "minutes": minutes,
         "webhook_url": webhook_url.strip() if webhook_url else None,
         "price_threshold": float(price_threshold) if price_threshold not in (None, "") else None,
         "created_at": datetime.utcnow().isoformat(),
-        "last_run_at": None,
     }
     insert_job(job)
     schedule_job(job)
@@ -351,7 +324,6 @@ def latest_text(job_id: str):
         return FileResponse(str(f))
     raise HTTPException(404, "No latest summary yet.")
 
-# Optional (still available): list files HTML if you ever want it
 @app.get("/jobs/{job_id}/files", response_class=HTMLResponse)
 def list_files(job_id: str):
     job_dir = DATA_DIR / job_id
