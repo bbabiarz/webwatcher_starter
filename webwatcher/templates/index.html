@@ -102,7 +102,7 @@
             <td>
               <a href="/jobs/{{ j.id }}/files" target="_blank">files</a><br>
               <a href="/data/{{ j.id }}/latest.png" target="_blank">latest.png</a><br>
-              <a href="/jobs/{{ j.id }}/latest" target="_blank">latest.txt</a>
+              <a href="/jobs/{{ j.id }}/latest" class="latest-txt">latest.txt</a>
             </td>
             <td class="row-actions">
               <a href="/jobs/{{ j.id }}/edit"><button type="button">Edit</button></a>
@@ -208,6 +208,25 @@
         .finally(() => {
           btn.disabled = false;
           btn.textContent = prevText;
+        });
+    });
+
+    // ---- latest.txt popup ----
+    tbody.addEventListener('click', (e) => {
+      const link = e.target.closest('.latest-txt');
+      if (!link) return;
+      e.preventDefault();
+      const win = window.open('', '', 'width=600,height=400');
+      fetch(link.href)
+        .then(r => r.ok ? r.text() : Promise.reject())
+        .then(text => {
+          const esc = text.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+          win.document.write(`<pre style="white-space: pre-wrap;">${esc}</pre>`);
+          win.document.close();
+        })
+        .catch(() => {
+          win.close();
+          toast('Failed to load latest.txt', true);
         });
     });
   </script>
