@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Optional, List
 
@@ -41,6 +42,37 @@ logging.basicConfig(level=logging.INFO)
 # ---------- App & templating ----------
 app = FastAPI(title="Web Watcher")
 templates = Jinja2Templates(directory="templates")
+
+
+_MONTH_ABBR = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sept",
+    "Oct",
+    "Nov",
+    "Dec",
+]
+
+
+def format_created_at(value: str) -> str:
+    """Format an ISO UTC timestamp into "Sept 12 2025 - 5:40 PM" in EST."""
+    try:
+        dt = datetime.fromisoformat(value).replace(tzinfo=ZoneInfo("UTC")).astimezone(
+            ZoneInfo("America/New_York")
+        )
+        month = _MONTH_ABBR[dt.month - 1]
+        return f"{month} {dt.day} {dt.year} - {dt.strftime('%-I:%M %p')}"
+    except Exception:
+        return value
+
+
+templates.env.filters["format_created_at"] = format_created_at
 
 STATIC_DIR = Path("static")
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
