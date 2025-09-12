@@ -100,7 +100,7 @@
             <td>{{ j.price_threshold or '—' }}</td>
             <td>{{ '%.2f'|format(j.lowest_price) if j.lowest_price is not none else '—' }}</td>
             <td>{{ j.minutes }} min</td>
-            <td class="muted">{{ j.created_at }}</td>
+            <td class="muted">{{ j.created_at | format_created_at }}</td>
             <td>
               <a href="/jobs/{{ j.id }}/files" target="_blank">files</a><br>
               <a href="/data/{{ j.id }}/latest.png" target="_blank">latest.png</a><br>
