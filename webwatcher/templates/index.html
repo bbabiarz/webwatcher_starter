@@ -84,6 +84,7 @@
             <th>URL</th>
             <th>Search text</th>
             <th>Price ≤</th>
+            <th>Lowest</th>
             <th>Every</th>
             <th>Created</th>
             <th>Artifacts</th>
@@ -97,6 +98,7 @@
             <td class="mono">{{ j.url }}</td>
             <td class="mono">{{ j.search_text }}</td>
             <td>{{ j.price_threshold or '—' }}</td>
+            <td>{{ '%.2f'|format(j.lowest_price) if j.lowest_price is not none else '—' }}</td>
             <td>{{ j.minutes }} min</td>
             <td class="muted">{{ j.created_at }}</td>
             <td>

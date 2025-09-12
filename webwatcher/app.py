@@ -65,7 +65,8 @@ def init_db():
                 webhook_url TEXT,
                 price_threshold REAL,
                 created_at TEXT NOT NULL,
-                sort_order INTEGER
+                sort_order INTEGER,
+                lowest_price REAL
             )
             """
         )
@@ -75,6 +76,8 @@ def init_db():
             c.execute("ALTER TABLE jobs ADD COLUMN price_threshold REAL")
         if "sort_order" not in cols:
             c.execute("ALTER TABLE jobs ADD COLUMN sort_order INTEGER")
+        if "lowest_price" not in cols:
+            c.execute("ALTER TABLE jobs ADD COLUMN lowest_price REAL")
 
         # Seed sort_order for rows that are NULL (keep current visual order: created_at DESC)
         c.execute("SELECT MAX(sort_order) FROM jobs WHERE sort_order IS NOT NULL")
@@ -95,8 +98,8 @@ def insert_job(job):
         c.execute("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM jobs")
         next_order = c.fetchone()[0]
         c.execute(
-            "INSERT INTO jobs (id,url,search_text,minutes,webhook_url,price_threshold,created_at,sort_order) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO jobs (id,url,search_text,minutes,webhook_url,price_threshold,created_at,sort_order,lowest_price) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 job["id"],
                 job["url"],
@@ -106,6 +109,7 @@ def insert_job(job):
                 job.get("price_threshold"),
                 job["created_at"],
                 next_order,
+                None,
             ),
         )
         conn.commit()
@@ -296,6 +300,18 @@ async def run_job(job_id: str):
     min_price = min(found_prices) if found_prices else None
     price_ok = (min_price is not None and price_threshold is not None and min_price <= float(price_threshold))
 
+    # Update lowest_price if a new minimum is found
+    lowest_price = job.get("lowest_price")
+    new_lowest = lowest_price
+    if min_price is not None and (lowest_price is None or min_price < float(lowest_price)):
+        with _conn() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE jobs SET lowest_price=? WHERE id=?", (min_price, job_id))
+            conn.commit()
+        new_lowest = min_price
+    elif lowest_price is not None:
+        new_lowest = float(lowest_price)
+
     # Notify logic (price-gated if threshold set)
     if price_threshold is not None:
         matched_for_notify = price_ok
@@ -315,6 +331,7 @@ async def run_job(job_id: str):
         f"Currency prefix: {CURRENCY_PREFIX}",
         f"Found prices: {', '.join(f'{p:.2f}' for p in found_prices) if found_prices else 'none'}",
         f"Min price: {min_price:.2f}" if min_price is not None else "Min price: —",
+        f"Lowest recorded price: {new_lowest:.2f}" if new_lowest is not None else "Lowest recorded price: —",
         f"Trigger reason: {trigger_reason}",
     ]
     (job_dir / "latest.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
